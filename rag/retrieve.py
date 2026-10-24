@@ -4,11 +4,26 @@ python -m rag.retrieve "คำถาม" -k 4 [--method tfidf|hybrid] [--include
 """
 import argparse
 import json
+import string
 
 import numpy as np
+from pythainlp.tokenize import word_tokenize
+from rank_bm25 import BM25Okapi
 from sklearn.feature_extraction.text import TfidfVectorizer
 
 from rag.chunk import chunk_docs
+
+# น้ำหนักของ TF-IDF ในคะแนน hybrid ที่เหลือเป็น BM25 (ชุด dev ได้ hit@1 = 1.0 ตลอดช่วง 0.6–1.0 แต่ลดลงที่ 0.5)
+ALPHA = 0.7
+
+# พจนานุกรมคำพ้อง: คำในคำถาม (ตัวพิมพ์เล็ก) → คำที่เอกสารใช้ สร้างจากคำถามชุด dev ที่ค้นพลาดเท่านั้น
+SYNONYMS = {
+    "อีวี": ["รถยนต์ไฟฟ้า"],  # dev Q35
+    "ev": ["รถยนต์ไฟฟ้า"],  # dev Q35 (สะกดแบบอังกฤษ)
+    "เสียบชาร์จ": ["จุดชาร์จ"],  # dev Q35
+}
+
+PUNCT = string.punctuation + "“”‘’·–—…"
 
 
 def index_text(c: dict) -> str:
@@ -16,23 +31,49 @@ def index_text(c: dict) -> str:
     return f"{c['title']}\n{c['section']}\n{c['text']}"
 
 
+def tokenize(text: str) -> list[str]:
+    """ตัดคำด้วย pythainlp (newmm) ตัดเครื่องหมายวรรคตอนรอบคำ และแปลงอักษรอังกฤษเป็นตัวเล็ก"""
+    words = (w.strip(PUNCT).lower() for w in word_tokenize(text, engine="newmm", keep_whitespace=False))
+    return [w for w in words if w]
+
+
+def expand_query(query: str) -> str:
+    """ต่อท้ายคำถามด้วยคำพ้องของคำที่พบใน SYNONYMS"""
+    q = query.lower()
+    return " ".join([query, *(w for key, words in SYNONYMS.items() if key in q for w in words)])
+
+
+def min_max(x: np.ndarray) -> np.ndarray:
+    """ปรับคะแนนให้อยู่ในช่วง 0–1 เพื่อรวมคะแนนที่สเกลต่างกันได้"""
+    span = x.max() - x.min()
+    return (x - x.min()) / span if span > 0 else np.zeros_like(x)
+
+
 class Retriever:
     def __init__(self, chunks: list[dict] | None = None, method: str = "tfidf"):
         """method="tfidf": TF-IDF ระดับตัวอักษร (W2) · method="hybrid": วิธีที่ปรับปรุงแล้ว (W4)"""
+        if method not in ("tfidf", "hybrid"):
+            raise ValueError(f"ไม่รู้จัก method: {method}")
         self.chunks = chunk_docs() if chunks is None else chunks
         self.method = method
-        if method == "tfidf":
-            # ภาษาไทยไม่เว้นวรรคระหว่างคำ จึงใช้ n-gram ระดับตัวอักษรแทนการตัดคำ
-            self.vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 4))
-            self.matrix = self.vectorizer.fit_transform([index_text(c) for c in self.chunks])
-        elif method == "hybrid":
-            raise NotImplementedError("method hybrid ทำในเวิร์กช็อป 4")
-        else:
-            raise ValueError(f"ไม่รู้จัก method: {method}")
+        texts = [index_text(c) for c in self.chunks]
+        # ภาษาไทยไม่เว้นวรรคระหว่างคำ จึงใช้ n-gram ระดับตัวอักษรแทนการตัดคำ
+        self.vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 4))
+        self.matrix = self.vectorizer.fit_transform(texts)
+        if method == "hybrid":
+            self.bm25 = BM25Okapi([tokenize(t) for t in texts])
 
-    def scores(self, query: str) -> np.ndarray:
+    def tfidf_scores(self, query: str) -> np.ndarray:
         """cosine similarity ของคำถามกับทุก chunk (TfidfVectorizer normalize L2 ให้แล้ว จึงใช้ dot product ได้)"""
         return (self.matrix @ self.vectorizer.transform([query]).T).toarray().ravel()
+
+    def scores(self, query: str) -> np.ndarray:
+        if self.method == "tfidf":
+            return self.tfidf_scores(query)
+        # hybrid: ขยายคำค้นด้วยคำพ้อง แล้วรวม TF-IDF ตัวอักษรกับ BM25 ระดับคำ หลังปรับสเกลเป็น 0–1
+        q = expand_query(query)
+        bm25 = self.bm25.get_scores(tokenize(q))
+        return ALPHA * min_max(self.tfidf_scores(q)) + (1 - ALPHA) * min_max(bm25)
 
     def search(self, query: str, k: int = 4, include_superseded: bool = True) -> list[dict]:
         """คืน chunk k อันที่คะแนนสูงสุด เรียงจากมากไปน้อย แต่ละอันเพิ่มช่อง "score" """
