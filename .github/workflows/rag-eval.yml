@@ -24,6 +24,12 @@ jobs:
       - name: pytest
         run: pytest -q
 
+      - name: pytest (W4 targets)
+        run: pytest -q -m w4
+
       # evaluate.py เขียนตารางผลลง $GITHUB_STEP_SUMMARY เอง และ exit 1 ถ้า hit@4 ต่ำกว่า 0.9
-      - name: Retrieval eval (dev)
+      - name: Retrieval eval (dev, tfidf)
         run: python -m rag.evaluate --split dev --method tfidf -k 4 --min-hit 0.9
+
+      - name: Retrieval eval (dev, hybrid)
+        run: python -m rag.evaluate --split dev --method hybrid -k 4 --min-hit 0.9
