@@ -1,0 +1,29 @@
+name: rag-eval
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install requirements
+        run: pip install -r requirements.txt
+
+      - name: pytest
+        run: pytest -q
+
+      # evaluate.py เขียนตารางผลลง $GITHUB_STEP_SUMMARY เอง และ exit 1 ถ้า hit@4 ต่ำกว่า 0.9
+      - name: Retrieval eval (dev)
+        run: python -m rag.evaluate --split dev --method tfidf -k 4 --min-hit 0.9
